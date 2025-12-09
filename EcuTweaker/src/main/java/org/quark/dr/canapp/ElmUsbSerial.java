@@ -18,6 +18,7 @@ import java.util.List;
 public class ElmUsbSerial extends ElmBase {
     private static final String ACTION_USB_PERMISSION = "org.quark.dr.canapp.USB_PERMISSION";
     private static UsbSerialPort msPort = null;
+    private static UsbSerialPort mPortNeedingPermission = null;
     private static PendingIntent mPermissionIntent;
     private final Context mContext;
     private ConnectedThread mConnectedThread;
@@ -41,43 +42,119 @@ public class ElmUsbSerial extends ElmBase {
         setState(STATE_DISCONNECTED);
         mUsbSerial = serial;
         msPort = null;
+        mPortNeedingPermission = null;
         final UsbManager usbManager = (UsbManager) mContext.getApplicationContext().getSystemService(Context.USB_SERVICE);
 
-        if (usbManager == null)
+        if (usbManager == null) {
+            logInfo("USB : UsbManager is null");
             return false;
+        }
 
         final List<UsbSerialDriver> drivers =
                 UsbSerialProber.getDefaultProber().findAllDrivers(usbManager);
+
+        if (drivers.isEmpty()) {
+            logInfo("USB : No USB serial devices found");
+            return false;
+        }
+
+        logInfo("USB : Found " + drivers.size() + " USB driver(s)");
+        
+        // Log all available devices for debugging
+        logInfo("USB : Looking for device with serial: '" + serial + "'");
+        int deviceIndex = 0;
+        for (final UsbSerialDriver driver : drivers) {
+            deviceIndex++;
+            logInfo("USB : Device " + deviceIndex + " - Driver: " + driver.getClass().getSimpleName() + 
+                    ", VendorId: 0x" + Integer.toHexString(driver.getDevice().getVendorId()) + 
+                    ", ProductId: 0x" + Integer.toHexString(driver.getDevice().getProductId()) +
+                    ", Ports: " + driver.getPorts().size());
+        }
+
+        // Special case: if serial is empty/null and only one device, use it
+        boolean useFirstDevice = (serial == null || serial.isEmpty()) && drivers.size() == 1;
+        if (useFirstDevice) {
+            logInfo("USB : Serial is empty and only one device found, will use it");
+        }
 
         final List<UsbSerialPort> result = new ArrayList<>();
         for (final UsbSerialDriver driver : drivers) {
             final List<UsbSerialPort> ports = driver.getPorts();
             result.addAll(ports);
             for (UsbSerialPort port : ports) {
-                if (!usbManager.hasPermission(port.getDriver().getDevice())) {
-                    logInfo("No permission to access USB device " + serial);
-                }
-                UsbDeviceConnection connection = usbManager.openDevice(port.getDriver().getDevice());
-                if (connection == null) {
-                    logInfo("USB : error opening device connection");
-                    continue;
-                }
                 try {
-                    port.open(connection);
-                    if (port.getSerial().equals(mUsbSerial)) {
-                        msPort = port;
-                        break;
-                    } else {
-                        msPort = null;
-                        port.close();
+                    // Check permission first, before trying to get serial
+                    if (!usbManager.hasPermission(port.getDriver().getDevice())) {
+                        logInfo("USB : Found device without permission, requesting...");
+                        mPortNeedingPermission = port;
+                        usbManager.requestPermission(port.getDriver().getDevice(), mPermissionIntent);
+                        continue; // Check other devices, but remember this one needs permission
                     }
-                } catch (IOException e) {
-                    logInfo("USB : error opening port");
+                    
+                    // We have permission, try to open
+                    UsbDeviceConnection connection = usbManager.openDevice(port.getDriver().getDevice());
+                    if (connection == null) {
+                        logInfo("USB : error opening device connection (connection is null)");
+                        continue;
+                    }
+                    
+                    // Open the port to get serial number
+                    try {
+                        port.open(connection);
+                        
+                        // Now get the serial number (requires open connection)
+                        String portSerial = port.getSerial();
+                        if (portSerial == null) portSerial = "";
+                        logInfo("USB : Opened device with serial: '" + portSerial + "'");
+                        
+                        // Check if this is the device we're looking for
+                        // Match by serial OR if both are empty/null and only one device exists
+                        boolean isMatch = portSerial.equals(mUsbSerial) || 
+                                         (useFirstDevice && (portSerial.isEmpty() || mUsbSerial.isEmpty()));
+                        
+                        if (isMatch) {
+                            msPort = port;
+                            logInfo("USB : Found matching device!");
+                            // Store the actual serial for future use
+                            if (!portSerial.isEmpty() && mUsbSerial.isEmpty()) {
+                                mUsbSerial = portSerial;
+                            }
+                            break;
+                        } else {
+                            // Not the right device, close it
+                            logInfo("USB : Not the device we're looking for (wanted: '" + mUsbSerial + "'), closing");
+                            port.close();
+                        }
+                    } catch (IOException e) {
+                        // Failed to open, close the connection
+                        try {
+                            connection.close();
+                        } catch (Exception ce) {
+                            // Ignore close errors
+                        }
+                        logInfo("USB : IOException opening port: " + e.getClass().getName() + " - " + e.getMessage());
+                        if (e.getCause() != null) {
+                            logInfo("USB : Caused by: " + e.getCause().getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    logInfo("USB : Exception accessing device: " + e.getClass().getName() + " - " + e.getMessage());
+                    if (e.getCause() != null) {
+                        logInfo("USB : Caused by: " + e.getCause().getMessage());
+                    }
                 }
+            }
+            if (msPort != null) {
+                break;
             }
         }
 
         if (msPort == null) {
+            if (mPortNeedingPermission != null) {
+                logInfo("USB : Waiting for user to grant permission");
+            } else {
+                logInfo("USB : Could not find or open USB device with serial: " + serial);
+            }
             return false;
         }
 
@@ -141,20 +218,38 @@ public class ElmUsbSerial extends ElmBase {
 
     @Override
     public boolean hasDevicePermission() {
-        if (msPort == null)
-            return true;
         final UsbManager usbManager = (UsbManager) mContext.getApplicationContext().getSystemService(Context.USB_SERVICE);
         if (usbManager == null) return false;
-        return usbManager.hasPermission(msPort.getDriver().getDevice());
+        
+        // Check the connected port first
+        if (msPort != null) {
+            return usbManager.hasPermission(msPort.getDriver().getDevice());
+        }
+        
+        // Check the port that needs permission
+        if (mPortNeedingPermission != null) {
+            return usbManager.hasPermission(mPortNeedingPermission.getDriver().getDevice());
+        }
+        
+        // No port to check
+        return true;
     }
 
     @Override
     public void requestPermission() {
-        if (msPort == null)
-            return;
         final UsbManager usbManager = (UsbManager) mContext.getApplicationContext().getSystemService(Context.USB_SERVICE);
         if (usbManager == null) return;
-        usbManager.requestPermission(msPort.getDriver().getDevice(), mPermissionIntent);
+        
+        // Request permission for the port that needs it
+        if (mPortNeedingPermission != null) {
+            logInfo("USB : Requesting permission for device");
+            usbManager.requestPermission(mPortNeedingPermission.getDriver().getDevice(), mPermissionIntent);
+        } else if (msPort != null) {
+            logInfo("USB : Requesting permission for connected device");
+            usbManager.requestPermission(msPort.getDriver().getDevice(), mPermissionIntent);
+        } else {
+            logInfo("USB : No device to request permission for");
+        }
     }
 
     /*

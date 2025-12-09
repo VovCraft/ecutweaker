@@ -264,7 +264,9 @@ public class Ch34xSerialDriver implements UsbSerialDriver {
                 throw new IOException("init failed! #5");
             }
 
-            checkState("init #6", 0x95, 0x0706, new int[]{0xff, 0xee});
+            // Note: Some CH340 clones/variants return different values (e.g., 0xa8 instead of 0xee)
+            // Using -1 to accept any value for compatibility
+            checkState("init #6", 0x95, 0x0706, new int[]{0xff, -1 /* 0xee or 0xa8 */});
 
             if (controlOut(0xa1, 0x501f, 0xd90a) < 0) {
                 throw new IOException("init failed! #7");
@@ -274,7 +276,8 @@ public class Ch34xSerialDriver implements UsbSerialDriver {
 
             writeHandshakeByte();
 
-            checkState("init #10", 0x95, 0x0706, new int[]{-1/* 0x9f, 0xff*/, 0xee});
+            // Also relaxed for different CH340 variants
+            checkState("init #10", 0x95, 0x0706, new int[]{-1/* 0x9f, 0xff*/, -1 /* 0xee or other */});
         }
 
 
